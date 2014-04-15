@@ -26,7 +26,7 @@ usage
 	10.0.0.1: send 9000 bytes icmp: echo reply OK (0.768 ms)
 	10.0.0.1: send 9004 bytes icmp: Message too long
 	10.0.0.1: send 9002 bytes icmp: Message too long
-	detect 10.0.0.1 MTU <span class="emphasis">9000</span>
+	detect 10.0.0.1 MTU 9000
 
 	(and set mtu size of routing table automatically)
 	# netstat -nrfinet|fgrep 10.0.0.1
