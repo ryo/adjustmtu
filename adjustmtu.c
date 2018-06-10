@@ -59,6 +59,9 @@
 
 #undef RTMSG_DEBUG
 
+#ifndef __packed
+#define __packed __attribute__((packed))
+#endif
 
 int main(int, char *[]);
 static int usage(void);
