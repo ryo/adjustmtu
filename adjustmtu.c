@@ -320,7 +320,7 @@ detectmtu(struct in_addr dst, struct in_addr src, int dontroute)
 		logging(LOG_ERR, "setsockopt: IP_HDRINCL", strerror(errno));
 		return -1;
 	}
-	if (setsockopt(s, SOL_SOCKET, SO_DONTROUTE, (char *)&n, sizeof(n)) == -1) {
+	if (dontroute && setsockopt(s, SOL_SOCKET, SO_DONTROUTE, (char *)&n, sizeof(n)) == -1) {
 		logging(LOG_ERR, "setsockopt: SO_DONTROUTE", strerror(errno));
 		return -1;
 	}
