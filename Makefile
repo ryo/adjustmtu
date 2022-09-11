@@ -1,11 +1,12 @@
-#	$Id: Makefile,v 1.3 2010/08/02 04:00:15 ryo Exp $
+#	$Id: Makefile,v 1.5 2022/09/09 19:26:54 ryo Exp $
 
 PROG=	adjustmtu
-SRCS=	adjustmtu.c
+SRCS=	adjustmtu.c rtmsg_utils.c arpresolv.c logging.c
+WARNS=	4
 
 NOMAN=	yes
 
-LDADD+=	
+LDADD+=	-lutil
 DPADD+=	
 
 .include <bsd.prog.mk>

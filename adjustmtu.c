@@ -1,7 +1,7 @@
-/*	$Id: adjustmtu.c,v 1.27 2012/03/21 08:59:03 ryo Exp $	*/
+/*	$Id: adjustmtu.c,v 1.31 2022/09/11 18:49:19 ryo Exp $	*/
 /*-
  *
- * Copyright (c) 2010 SHIMIZU Ryo <ryo@nerv.org>
+ * Copyright (c) 2010 Ryo Shimizu <ryo@nerv.org>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -27,53 +27,52 @@
  */
 
 #include <sys/param.h>
-#include <sys/time.h>
-#include <sys/timeb.h>
-#include <sys/socket.h>
+#include <sys/event.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/sysctl.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+
 #include <net/if.h>
 #include <net/route.h>
 #include <net/if_types.h>
 #include <net/if_dl.h>
+
 #include <netinet/in_systm.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
+
 #include <arpa/inet.h>
+
 #include <inttypes.h>
+#include <ctype.h>
+#include <err.h>
+#include <errno.h>
+#include <ifaddrs.h>
+#include <netdb.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdarg.h>
 #include <string.h>
-#include <ctype.h>
-#include <unistd.h>
-#include <syslog.h>
-#include <ifaddrs.h>
-#include <netdb.h>
+#include <sysexits.h>
 #include <time.h>
-#include <err.h>
-#include <errno.h>
+#include <unistd.h>
+#include <util.h>
 
-#undef RTMSG_DEBUG
+#include "adjustmtu.h"
+#include "arpresolv.h"
+#include "logging.h"
+#include "rtmsg_utils.h"
 
 #ifndef __packed
 #define __packed __attribute__((packed))
 #endif
-
-int main(int, char *[]);
-static int usage(void);
-static int adjustmtu_daemon(void);
-static int adj_route_mtu(struct in_addr, struct in_addr, int);
-static void set_route_mtu(struct in_addr, unsigned int);
-static int rtmsg_proc(struct rt_msghdr *, size_t);
-static int detectmtu(struct in_addr, struct in_addr, int);
-static int pinger(int, struct in_addr, struct in_addr,
-                  unsigned int, uint16_t, unsigned int, int);
-static unsigned long tv_delta(struct timeval *, struct timeval *);
-static void logging(int, char const *fmt, ...);
+#ifndef __aligned
+#define __aligned(x) __attribute__((__aligned__(x)))
+#endif
 
 struct iflist_item {
 	LIST_ENTRY(iflist_item) si_list;
@@ -86,38 +85,53 @@ static struct iflist_item *iflist_exists(char *);
 static int iflist_count(void);
 
 
+static int use_arp = 1;
+static int use_ping = 1;	//XXXXXXXXXXXX
+static int dont_set_route = 0;
 static int do_daemon = 0;
 
-#define PING_TIMEOUT		(200 * 1000)	/* 200msec */
+static int sigalrm;
+static int siginfo;
+static int sighup;
+static int sigterm;
+
+#define REPLY_TIMEOUT		(50 * 1000)	/* 50msec */
 #define MTUSIZE_MAX		(1024 * 64)
 #define MTUSIZE_MIN		1280
 #define MTUSIZE_ETHER_MIN	1500
-static int mtusize_min = MTUSIZE_MIN;
+static int timeout_us = REPLY_TIMEOUT;
+static int mtusize_min = MTUSIZE_ETHER_MIN;
 
 static int
-usage()
+usage(void)
 {
-	fprintf(stderr, "usage: adjustmtu [options] [if0 [if1 ...]]\n");
-	fprintf(stderr, "\t-d\t\tdaemon mode\n");
-	fprintf(stderr, "\t-o <host>\ttarget host (one shot mode)\n");
-	return 1;
-}
-
-static unsigned long
-tv_delta(struct timeval *a, struct timeval *b)
-{
-	unsigned long d;
-
-	d = (b->tv_sec * 1000000 + b->tv_usec) -
-	    (a->tv_sec * 1000000 + a->tv_usec);
-
-	return d;
+	fprintf(stderr, "usage: adjustmtu [options] [<host> ...]\n");
+	fprintf(stderr, "	<host>		Target host (one shot mode)\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "	-v		Verbose.\n");
+	fprintf(stderr, "	-n		Only detects mtu, does not set the\n");
+	fprintf(stderr, "			routing table.\n");
+	fprintf(stderr, "	-t <timeout>	Specifies ping/arp timeout in millisecond.\n");
+	fprintf(stderr, "			Default is 50.\n");
+	fprintf(stderr, "	-A		Always use padded arp to detect mtu.\n");
+	fprintf(stderr, "	-P		Always use ping (ICMP-ECHO) to detect mtu.\n");
+	fprintf(stderr, "	-I <addr>	Specifies the source address to be used\n");
+	fprintf(stderr, "			for ping/arp.\n");
+	fprintf(stderr, "	-i <interface>	Specifies the interface to monitor.\n");
+	fprintf(stderr, "			May be specified more than once.\n");
+	fprintf(stderr, "	-d		Daemon mode. (Used with the -i)\n");
+	fprintf(stderr, "\n");
+	fprintf(stderr, "	e.g.) adjustmtu -v host1		# one shot mode\n");
+	fprintf(stderr, "	e.g.) adjustmtu -d -i wm0 -i aq0	# daemon mode\n");
+	fprintf(stderr, "\n");
+	return EX_USAGE;
 }
 
 static u_int16_t
-in_cksum(uint16_t *p, int len)
+in_cksum(void *p0, int len)
 {
 	u_int32_t sum;
+	uint16_t *p = p0;
 
 	for (sum = 0; len >= 2; len -= 2)
 		sum += *p++;
@@ -130,8 +144,17 @@ in_cksum(uint16_t *p, int len)
 	return ~sum;
 }
 
-uint8_t packetbuf[MTUSIZE_MAX];
-uint8_t rcvbuf[MTUSIZE_MAX];
+uint8_t packetbuf[MTUSIZE_MAX] __aligned(4);
+uint8_t rcvbuf[MTUSIZE_MAX] __aligned(4);
+
+/*
+ * A 0 is returned if the ping succeeds,
+ * 1, 2, 3 means below.
+ * Otherwise (minus value), it is a system error.
+ */
+#define PINGER_TIMEOUT	1
+#define PINGER_UNREACH	2
+#define PINGER_TOOBIG	3
 
 static int
 pinger(int s, struct in_addr src, struct in_addr dst,
@@ -149,7 +172,7 @@ pinger(int s, struct in_addr src, struct in_addr dst,
 				uint16_t cksum;
 				uint16_t id;
 				uint16_t seq;
-			} icmp __packed;
+			} icmp __packed __aligned(4);
 		} header;
 		uint8_t data[];
 	} __packed *pktbuf;
@@ -194,9 +217,9 @@ pinger(int s, struct in_addr src, struct in_addr dst,
 	pktbuf->header.icmp.cksum = 0;
 	pktbuf->header.icmp.id = arc4random() & 0xffff;
 	pktbuf->header.icmp.seq = htons(seq);
-	pktbuf->header.icmp.cksum = in_cksum((uint16_t *)&pktbuf->header.icmp,
+	pktbuf->header.icmp.cksum = in_cksum(&pktbuf->header.icmp,
 	    size - sizeof(struct ip));
-	pktbuf->header.ip.ip_sum = in_cksum((uint16_t *)&pktbuf->header.ip, size);
+	pktbuf->header.ip.ip_sum = in_cksum(&pktbuf->header.ip, size);
 
 
 	/*
@@ -215,7 +238,7 @@ pinger(int s, struct in_addr src, struct in_addr dst,
 			logging(LOG_DEBUG, "%s: send %d bytes icmp: %s",
 			    inet_ntoa(dst), size, strerror(errno));
 			/* continuable error */
-			return 3;
+			return PINGER_TOOBIG;
 		}
 		logging(LOG_ERR, "%s: send %d bytes icmp: %s",
 		    inet_ntoa(dst), size, strerror(errno));
@@ -237,7 +260,7 @@ pinger(int s, struct in_addr src, struct in_addr dst,
 	}
 	if (nfound == 0) {
 		/* icmp request timeout */
-		logging(LOG_NOTICE, "%s: %d bytes ping timeout",
+		logging(LOG_DEBUG, "%s: %d bytes ping timeout",
 		    inet_ntoa(dst), size);
 		/* continuable error */
 		return 1;
@@ -269,7 +292,7 @@ pinger(int s, struct in_addr src, struct in_addr dst,
 				/* not for me? retry to receive */
 				goto retry;
 			}
-			logging(LOG_INFO,
+			logging(LOG_DEBUG,
 			    "%s: send %d bytes icmp: echo reply OK (%.3f ms)",
 			    inet_ntoa(dst), size,
 			    tv_delta(&tv_send, &tv_recv) / 1000.0);
@@ -295,34 +318,56 @@ static int
 detectmtu(struct in_addr dst, struct in_addr src, int dontroute)
 {
 	unsigned int base, d, mtu;
-	int i, s, n, rc, result;
+	int i, s = -1, rc, result;
 	uint16_t seq;
+	char ifname[IFNAMSIZ + 1];
 
-	s = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-	if (s < 0) {
-		logging(LOG_ERR, "socket: AF_INET: SOCK_RAW: %s",
-		    strerror(errno));
-		return -1;
-	}
+	if (use_arp) {
+		struct rtmaddrs_ss rtmaddrs_ss;
 
-	n = MTUSIZE_MAX;
-	if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, &n, sizeof(n)) == -1) {
-		logging(LOG_ERR, "setsockopt: IP_SNDBUF", strerror(errno));
-		return -1;
-	}
-	if (setsockopt(s, SOL_SOCKET, SO_RCVBUF, &n, sizeof(n)) == -1) {
-		logging(LOG_ERR, "setsockopt: IP_RCVBUF", strerror(errno));
-		return -1;
-	}
+		memset(&rtmaddrs_ss, 0, sizeof(rtmaddrs_ss));
+		sockaddr_init((struct sockaddr *)&rtmaddrs_ss.dst, AF_INET);
+		((struct sockaddr_in *)&rtmaddrs_ss.dst)->sin_addr = dst;
+		sockaddr_init((struct sockaddr *)&rtmaddrs_ss.ifp, AF_LINK);
+		rc = route_get(&rtmaddrs_ss);
+		if (rc != 0)
+			return -1;
 
-	n = 1;
-	if (setsockopt(s, IPPROTO_IP, IP_HDRINCL, (char *)&n, sizeof(n)) == -1) {
-		logging(LOG_ERR, "setsockopt: IP_HDRINCL", strerror(errno));
-		return -1;
-	}
-	if (dontroute && setsockopt(s, SOL_SOCKET, SO_DONTROUTE, (char *)&n, sizeof(n)) == -1) {
-		logging(LOG_ERR, "setsockopt: SO_DONTROUTE", strerror(errno));
-		return -1;
+		src = ((struct sockaddr_in *)&rtmaddrs_ss.ifa)->sin_addr;
+		memset(ifname, 0, sizeof(ifname));
+		i = ((struct sockaddr_dl *)&rtmaddrs_ss.ifp)->sdl_nlen;
+		if (i >= (int)sizeof(ifname))
+			i = sizeof(ifname) - 1;
+		strncpy(ifname, ((struct sockaddr_dl *)&rtmaddrs_ss.ifp)->sdl_data, i);
+	} else {
+		int n;
+
+		s = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+		if (s < 0) {
+			logging(LOG_ERR, "socket: AF_INET: SOCK_RAW: %s",
+			    strerror(errno));
+			return -1;
+		}
+
+		n = MTUSIZE_MAX;
+		if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, &n, sizeof(n)) == -1) {
+			logging(LOG_ERR, "setsockopt: IP_SNDBUF", strerror(errno));
+			return -1;
+		}
+		if (setsockopt(s, SOL_SOCKET, SO_RCVBUF, &n, sizeof(n)) == -1) {
+			logging(LOG_ERR, "setsockopt: IP_RCVBUF", strerror(errno));
+			return -1;
+		}
+
+		n = 1;
+		if (setsockopt(s, IPPROTO_IP, IP_HDRINCL, (char *)&n, sizeof(n)) == -1) {
+			logging(LOG_ERR, "setsockopt: IP_HDRINCL", strerror(errno));
+			return -1;
+		}
+		if (dontroute && setsockopt(s, SOL_SOCKET, SO_DONTROUTE, (char *)&n, sizeof(n)) == -1) {
+			logging(LOG_ERR, "setsockopt: SO_DONTROUTE", strerror(errno));
+			return -1;
+		}
 	}
 
 
@@ -341,10 +386,20 @@ detectmtu(struct in_addr dst, struct in_addr src, int dontroute)
 		else {
 			/* retry 3 times, if failure */
 			for (i = 0; i < 3; i++) {
-				rc = pinger(s, src, dst, mtu * 2, seq++, PING_TIMEOUT,
-				    dontroute);
-				if (rc != 1)	/* not timeout */
-					break;
+				if (use_arp) {
+					struct ether_addr eth;
+
+					rc = arpresolv(ifname, &src, &dst, &eth, mtu * 2 + ETHER_HDR_LEN, timeout_us);
+					if (rc != ARPRESOLV_TIMEOUT) {
+						break;
+					}
+				} else {
+					rc = pinger(s, src, dst, mtu * 2, seq++, timeout_us,
+					    dontroute);
+					if (rc != PINGER_TIMEOUT) {
+						break;
+					}
+				}
 			}
 		}
 
@@ -360,7 +415,7 @@ detectmtu(struct in_addr dst, struct in_addr src, int dontroute)
 }
 
 /*
- * similarly to "/sbin/route change <addr> -mtu <mtu>"
+ * similarly to "/sbin/route change/add <addr> <addr> -mtu <mtu>"
  */
 static void
 set_route_mtu(struct in_addr addr, unsigned int mtu)
@@ -368,6 +423,7 @@ set_route_mtu(struct in_addr addr, unsigned int mtu)
 	struct {
 		struct rt_msghdr rtmsg_rtm;
 		struct sockaddr_in rtmsg_sin;
+		struct sockaddr_in rtmsg_sin2;
 	} rtmsg;
 	ssize_t rc;
 	int s;
@@ -379,21 +435,33 @@ set_route_mtu(struct in_addr addr, unsigned int mtu)
 	}
 	shutdown(s, SHUT_RD);
 
+	/* First, try "route change", and if that fails, try "route add" */
 	memset(&rtmsg, 0, sizeof(rtmsg));
 	rtmsg.rtmsg_sin.sin_len = sizeof(struct sockaddr_in);
 	rtmsg.rtmsg_sin.sin_family = AF_INET;
 	rtmsg.rtmsg_sin.sin_addr = addr;
+	rtmsg.rtmsg_sin2.sin_len = sizeof(struct sockaddr_in);
+	rtmsg.rtmsg_sin2.sin_family = AF_INET;
+	rtmsg.rtmsg_sin2.sin_addr = addr;
 
 	rtmsg.rtmsg_rtm.rtm_msglen = sizeof(rtmsg);
 	rtmsg.rtmsg_rtm.rtm_version = RTM_VERSION;
 	rtmsg.rtmsg_rtm.rtm_type = RTM_CHANGE;
 	rtmsg.rtmsg_rtm.rtm_flags =
-	    RTF_UP | RTF_HOST | RTF_GATEWAY | RTF_STATIC;
-	rtmsg.rtmsg_rtm.rtm_addrs = RTA_DST;
+	    RTF_GATEWAY | RTF_HOST | RTF_UP;
+	rtmsg.rtmsg_rtm.rtm_addrs = RTA_DST | RTA_GATEWAY;
 	rtmsg.rtmsg_rtm.rtm_inits = RTV_MTU;
 	rtmsg.rtmsg_rtm.rtm_rmx.rmx_mtu = mtu;
 
 	rc = write(s, &rtmsg, rtmsg.rtmsg_rtm.rtm_msglen);
+
+	/* failed "route change", retry "route add" */
+	if (rc == -1 && errno == ESRCH &&
+	    rtmsg.rtmsg_rtm.rtm_type == RTM_CHANGE) {
+		rtmsg.rtmsg_rtm.rtm_type = RTM_ADD;
+		rc = write(s, &rtmsg, rtmsg.rtmsg_rtm.rtm_msglen);
+	}
+
 	if (rc == -1) {
 		logging(LOG_ERR, "write to routing socket: %s: %s",
 		    inet_ntoa(addr), strerror(errno));
@@ -402,36 +470,20 @@ set_route_mtu(struct in_addr addr, unsigned int mtu)
 	close(s);
 }
 
-static int
+static void
 adj_route_mtu(struct in_addr dst, struct in_addr src, int dontroute)
 {
 	int mtu;
 
 	mtu = detectmtu(dst, src, dontroute);
 	if (mtu < 0)
-		return -1;
-	if (mtu > 0) {
-		logging(LOG_INFO, "detect %s MTU %d",
-		    inet_ntoa(dst), mtu);
+		return;
 
+	logging(LOG_NOTICE, "detect %s mtu %d",
+	    inet_ntoa(dst), mtu);
+
+	if (mtu >= mtusize_min && !dont_set_route)
 		set_route_mtu(dst, mtu);
-	}
-	return 0;
-}
-
-static void
-logging(int prio, char const *fmt, ...)
-{
-	va_list ap;
-
-	va_start(ap, fmt);
-	if (do_daemon) {
-		vsyslog(prio, fmt, ap);
-	} else {
-		vfprintf(stderr, fmt, ap);
-		printf("\n");
-	}
-	va_end(ap);
 }
 
 static struct iflist_item *
@@ -487,10 +539,6 @@ static int
 rtmsg_proc(struct rt_msghdr *rtm, size_t size)
 {
 	char *end;
-#ifdef RTMSG_DEBUG
-	char logbuf[1024];
-#endif
-	struct sockaddr_in *sin;
 
 	for (end = (char *)rtm + size; (char *)rtm < end; 
 	    rtm = (struct rt_msghdr *)((char *)rtm + rtm->rtm_msglen)) {
@@ -503,171 +551,174 @@ rtmsg_proc(struct rt_msghdr *rtm, size_t size)
 		if (rtm->rtm_type != RTM_ADD)
 			continue;
 
-		if ((rtm->rtm_flags & (RTF_UP|RTF_HOST|RTF_LLINFO)) !=
-		    (RTF_UP|RTF_HOST|RTF_LLINFO)) {
-			logging(LOG_DEBUG,
-			    "rtm_flags: 0x%x: no arp entry? ignore",
-			    rtm->rtm_flags);
-			continue;
-		}
-		if (rtm->rtm_addrs != (RTA_DST|RTA_GATEWAY|RTA_IFP|RTA_IFA)) {
-			logging(LOG_DEBUG,
-			    "rtm_addrs: 0x%x: no arp entry? ignore",
-			    rtm->rtm_addrs);
-			continue;
-		}
-
-		{
-			int i;
-			char *p;
-			struct sockaddr *saddr[RTAX_MAX];
-			struct sockaddr *sa;
-			struct sockaddr_dl *sadl;
-			char ifname[IF_NAMESIZE];
-
-#ifdef RTMSG_DEBUG
-			printf("====================\n");
-			printf("rtm_flags=0x%x\n", rtm->rtm_flags);
-			printf("rtm_addrs=0x%x\n", rtm->rtm_addrs);
-#endif /* RTMSG_DEBUG */
-
-			p = (char *)(rtm + 1);
-			for (i = 0; i < RTAX_MAX; i++) {
-				if ((1 << i) & rtm->rtm_addrs) {
-					sa = (struct sockaddr *)p;
-					saddr[i] = sa;
-#ifndef ROUNDUP
-#define ROUNDUP(a) \
-	((a) > 0 ? (1 + (((a) - 1) | (sizeof(long) - 1))) : sizeof(long))
+#ifndef RTF_LLINFO
+#define RTF_LLINFO	0x400	/* generated by ARP or NDP */
 #endif
-#ifndef RT_ADVANCE
-#define RT_ADVANCE(x, n) (x += ROUNDUP((n)->sa_len))
+#ifndef RTF_CLONED
+#define RTF_CLONED	0x2000	/* this is a cloned route */
 #endif
-					RT_ADVANCE(p, sa);
-				} else {
-					saddr[i] = NULL;
-				}
-			}
+		if ((rtm->rtm_flags & (RTF_UP|RTF_HOST|RTF_LLINFO|RTF_CLONED)) !=
+		    (RTF_UP|RTF_HOST|RTF_LLINFO|RTF_CLONED))
+			continue;
+		if (rtm->rtm_addrs != (RTA_DST|RTA_GATEWAY))
+			continue;
 
-#ifdef RTMSG_DEBUG
-			printf("af=%d: ", saddr[RTAX_DST]->sa_family);
-			getnameinfo(saddr[RTAX_DST], saddr[RTAX_DST]->sa_len,
-			    logbuf, sizeof(logbuf), NULL, 0, NI_NUMERICHOST);
-			printf("RTAX_DST: %s\n", logbuf);
+		struct rtmaddrs_ss rtmaddrs_ss;
+		rtmaddr_unpack(rtm, &rtmaddrs_ss);
+		if (rtmaddrs_ss.dst.ss_family != AF_INET)
+			continue;
 
-			printf("af=%d: ", saddr[RTAX_GATEWAY]->sa_family);
-			getnameinfo(saddr[RTAX_GATEWAY], saddr[RTAX_GATEWAY]->sa_len,
-			    logbuf, sizeof(logbuf), NULL, 0, NI_NUMERICHOST);
-			printf("RTAX_GATEWAY: %s\n", logbuf);
-
-			printf("af=%d: ", saddr[RTAX_IFP]->sa_family);
-			getnameinfo(saddr[RTAX_IFP], saddr[RTAX_IFP]->sa_len,
-			    logbuf, sizeof(logbuf), NULL, 0, NI_NUMERICHOST);
-			printf("RTAX_IFP: %s\n", logbuf);
-
-			printf("af=%d: ", saddr[RTAX_IFA]->sa_family);
-			getnameinfo(saddr[RTAX_IFA], saddr[RTAX_IFA]->sa_len,
-			    logbuf, sizeof(logbuf), NULL, 0, NI_NUMERICHOST);
-			printf("RTAX_IFA: %s\n", logbuf);
-#endif /* RTMSG_DEBUG */
-
-			/* extract interface name */
-			sadl = (struct sockaddr_dl *)saddr[RTAX_IFP];
-			if (sadl->sdl_nlen < sizeof(ifname)) {
-				memcpy(ifname, sadl->sdl_data, sadl->sdl_nlen);
-				ifname[sadl->sdl_nlen] = '\0';
-			}
-
-			/* no need to watch this interface */
-			if (iflist_exists(ifname) == NULL)
-				continue;
-
-			switch (sadl->sdl_type) {
-			case IFT_ETHER:
-			/* case IFT_XXX: // other jumbo frame interface */
-				break;
-			default:
-				continue;
-			}
-
-			if (saddr[RTAX_DST]->sa_family == AF_INET) {
-				struct in_addr src;
-				src.s_addr = INADDR_ANY;
-
-				sin = (struct sockaddr_in *)saddr[RTAX_DST];
-				if (adj_route_mtu(sin->sin_addr, src, 1) < 0)
-					return -1;
-			}
-		}
+		struct sockaddr_in *dst = (struct sockaddr_in *)&rtmaddrs_ss.dst;
+		struct in_addr src;
+		src.s_addr = INADDR_ANY;
+		adj_route_mtu(dst->sin_addr, src, 1);
 	}
 
 	return 0;
 }
 
-static int
-adjustmtu_daemon(void)
+static void
+sighandler(int signo)
 {
-	int s;
+	switch (signo) {
+	case SIGALRM:
+		sigalrm = 1;
+		break;
+	case SIGINFO:
+		siginfo = 1;
+		break;
+	case SIGHUP:
+		sighup = 1;
+		break;
+	case SIGTERM:
+		sigterm = 1;
+		break;
+	default:
+		break;
+	}
+}
+
+
+static int
+adjustmtu_daemon(int s)
+{
 	ssize_t rc;
 	struct {
 		struct rt_msghdr rtmsg_rtm;
 		char rtmsg_buf[];
 	} *rtmsg;
-#define RTMSG_BUFSIZE	(1024 * 64)
+#define RTMSG_BUFSIZE			(1024 * 64)
+#define NKEVENT	1
+	struct kevent kev[NKEVENT];
+	struct kevent ev[NKEVENT];
+	int kq, nev, nfd;
 
-	s = -1;
 	rtmsg = malloc(RTMSG_BUFSIZE);
 	if (rtmsg == NULL) {
 		logging(LOG_ERR, "cannot allocate memory");
-		goto daemon_failure;
+		rc = -1;
+		goto daemon_exit;
 	}
 
-	s = socket(PF_ROUTE, SOCK_RAW, 0);
-	if (s == -1) {
-		free(rtmsg);
-		logging(LOG_ERR, "socket: PF_ROUTE: %s", strerror(errno));
-		goto daemon_failure;
+	/* setup signal handlers */
+	struct sigaction sa;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_handler = sighandler;
+	sa.sa_flags = SA_RESTART;
+	if (sigaction(SIGALRM, &sa, NULL) != 0 ||
+	    sigaction(SIGHUP, &sa, NULL) != 0 ||
+	    sigaction(SIGTERM, &sa, NULL) != 0 ||
+	    sigaction(SIGINFO, &sa, NULL) != 0) {
+		logging(LOG_ERR, "sigaction: %s", strerror(errno));
+		return -1;
+	};
+
+	if ((kq = kqueue()) == -1) {
+		logging(LOG_ERR, "kqueue: %s", strerror(errno));
+		return -1;
+	}
+	nfd = 0;
+	EV_SET(&kev[nfd++], s, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, 0);
+	if (kevent(kq, kev, nfd, NULL, 0, NULL) == -1) {
+		logging(LOG_ERR, "kevent: %s", strerror(errno));
+		return -1;
 	}
 
 	/* daemon loop */
 	for (;;) {
-		rc = read(s, rtmsg, RTMSG_BUFSIZE);
-
-		if (rc <= 0) {
-			logging(LOG_ERR, "read: %s", strerror(errno));
-			goto daemon_failure;
+		if (sigalrm) {
+			sigalrm = 0;
+			logging(LOG_DEBUG, "catch SIGALRM");
 		}
 
-		if (rtmsg_proc(&rtmsg->rtmsg_rtm, rc) < 0)
-			goto daemon_failure;
+		if (siginfo) {
+			siginfo = 0;
+			logging(LOG_DEBUG, "catch SIGINFO");
+		}
+
+		if (sighup || sigterm) {
+			sighup = sigterm = 0;
+			logging(LOG_DEBUG, "caught signal. Terminate");
+			rc = 0;
+			goto daemon_exit;
+		}
+
+		nev = kevent(kq, NULL, 0, ev, nfd, NULL);
+		if (nev == -1) {
+			if (errno == EINTR)
+				continue;
+			logging(LOG_ERR, "kevent: %s", strerror(errno));
+			rc = -1;
+			goto daemon_exit;
+		}
+		if (nev == 0)
+			continue;
+
+		rc = read(s, rtmsg, RTMSG_BUFSIZE);
+		if (rc <= 0) {
+			logging(LOG_ERR, "read: %s", strerror(errno));
+			rc = -1;
+			goto daemon_exit;
+		}
+
+		if (rtmsg_proc(&rtmsg->rtmsg_rtm, rc) < 0) {
+			rc = -1;
+			goto daemon_exit;
+		}
 	}
 
- daemon_failure:
+ daemon_exit:
 	if (rtmsg != NULL)
 		free(rtmsg);
-	if (s >= 0)
-		close(s);
 
-	return -1;
+	return rc;
 }
 
 int
 main(int argc, char *argv[])
 {
-	int ch, error, i;
 	struct in_addr dst, src;
-	int oneshot;
 	struct addrinfo hints, *res;
+	int ch, error, s;
+
+	logging_filter(LOG_DEBUG, 0);
+	logging_filter(LOG_INFO, 0);
 
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_INET;
 	hints.ai_socktype = SOCK_RAW;
 
-	oneshot = 0;
 	dst.s_addr = INADDR_ANY;
 	src.s_addr = INADDR_ANY;
-	while ((ch = getopt(argc, argv, "dI:o:")) != -1) {
+
+	LIST_INIT(&iflist);
+
+	while ((ch = getopt(argc, argv, "AdI:i:nPt:v")) != -1) {
 		switch (ch) {
+		case 'A':
+			use_arp = 1;
+			use_ping = 0;
+			break;
 		case 'd':
 			do_daemon = 1;
 			break;
@@ -681,18 +732,22 @@ main(int argc, char *argv[])
 			src = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
 			freeaddrinfo(res);
 			break;
-		case 'o':
-			error = getaddrinfo(optarg, NULL, &hints, &res);
-			if (error) {
-				fprintf(stderr, "%s: %s\n", optarg,
-				    gai_strerror(error));
-				exit(1);
-			}
-			dst = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
-			freeaddrinfo(res);
-
-			adj_route_mtu(dst, src, 0);
-			oneshot++;
+		case 'i':
+			iflist_append(optarg);
+			break;
+		case 'n':
+			dont_set_route = 1;
+			break;
+		case 'P':
+			use_ping = 1;
+			use_arp = 0;
+			break;
+		case 't':
+			timeout_us = strtou(optarg, NULL, 10, 0, 0xffffffff, NULL) * 1000;
+			break;
+		case 'v':
+			logging_filter(LOG_DEBUG, 1);
+			logging_filter(LOG_INFO, 1);
 			break;
 		case '?':
 		default:
@@ -702,25 +757,44 @@ main(int argc, char *argv[])
 	argc -= optind;
 	argv += optind;
 
-	LIST_INIT(&iflist);
-	for (i = 0; i < argc; i++)
-		iflist_append(argv[i]);
 
-	if (iflist_count() != 0) {
-		if (do_daemon) {
-			daemon(0, 0);
-			openlog("adjustmtu", LOG_PID, LOG_DAEMON);
+	for (int i = 0; i < argc; i++) {
+		error = getaddrinfo(argv[i], NULL, &hints, &res);
+		if (error) {
+			fprintf(stderr, "%s: %s\n", optarg,
+			    gai_strerror(error));
+			exit(1);
 		}
-		mtusize_min = MTUSIZE_ETHER_MIN;
+		dst = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+		freeaddrinfo(res);
 
-		adjustmtu_daemon();
-
-		logging(LOG_ERR, "exiting");
-		return 1;
+		adj_route_mtu(dst, src, 1);
 	}
 
-	if (oneshot == 0)
-		return usage();
+	if (iflist_count() == 0)
+		return EX_OK;
 
-	return 0;
+	s = socket(PF_ROUTE, SOCK_RAW, 0);
+	if (s == -1) {
+		logging(LOG_ERR, "socket: PF_ROUTE: %s", strerror(errno));
+		return EX_OSERR;
+	}
+
+//	logging_filter(LOG_DEBUG, 1);
+//	logging_filter(LOG_INFO, 1);
+
+	if (do_daemon) {
+		daemon(0, 0);
+		logging_open("adjustmtu", LOG_PID, LOG_DAEMON);
+		error = adjustmtu_daemon(s);
+		logging(LOG_ERR, "exiting");
+	} else {
+		/* foreground daemon mode */
+		error = adjustmtu_daemon(s);
+	}
+	close(s);
+
+	if (error != 0)
+		return EX_OSERR;
+	return EX_OK;
 }
