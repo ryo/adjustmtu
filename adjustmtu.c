@@ -1,4 +1,4 @@
-/*	$Id: adjustmtu.c,v 1.31 2022/09/11 18:49:19 ryo Exp $	*/
+/*	$Id: adjustmtu.c,v 1.32 2022/09/12 16:02:31 ryo Exp $	*/
 /*-
  *
  * Copyright (c) 2010 Ryo Shimizu <ryo@nerv.org>
@@ -86,7 +86,7 @@ static int iflist_count(void);
 
 
 static int use_arp = 1;
-static int use_ping = 1;	//XXXXXXXXXXXX
+static int use_ping = 1;
 static int dont_set_route = 0;
 static int do_daemon = 0;
 
@@ -95,9 +95,9 @@ static int siginfo;
 static int sighup;
 static int sigterm;
 
-#define REPLY_TIMEOUT		(50 * 1000)	/* 50msec */
-#define MTUSIZE_MAX		(1024 * 64)
-#define MTUSIZE_MIN		1280
+#define REPLY_TIMEOUT		(200 * 1000)	/* PING or ARP reply timeout. default 200msec */
+
+#define MTUSIZE_MAX		(1024 * 64 - 2)
 #define MTUSIZE_ETHER_MIN	1500
 static int timeout_us = REPLY_TIMEOUT;
 static int mtusize_min = MTUSIZE_ETHER_MIN;
@@ -147,15 +147,7 @@ in_cksum(void *p0, int len)
 uint8_t packetbuf[MTUSIZE_MAX] __aligned(4);
 uint8_t rcvbuf[MTUSIZE_MAX] __aligned(4);
 
-/*
- * A 0 is returned if the ping succeeds,
- * 1, 2, 3 means below.
- * Otherwise (minus value), it is a system error.
- */
-#define PINGER_TIMEOUT	1
-#define PINGER_UNREACH	2
-#define PINGER_TOOBIG	3
-
+/* zero is returned if the ping succeeds */
 static int
 pinger(int s, struct in_addr src, struct in_addr dst,
        unsigned int size, uint16_t seq, unsigned int timeout, int dontroute)
@@ -238,11 +230,11 @@ pinger(int s, struct in_addr src, struct in_addr dst,
 			logging(LOG_DEBUG, "%s: send %d bytes icmp: %s",
 			    inet_ntoa(dst), size, strerror(errno));
 			/* continuable error */
-			return PINGER_TOOBIG;
+			return errno;
 		}
 		logging(LOG_ERR, "%s: send %d bytes icmp: %s",
 		    inet_ntoa(dst), size, strerror(errno));
-		return -1;
+		return errno;
 	}
 
  retry:
@@ -256,20 +248,19 @@ pinger(int s, struct in_addr src, struct in_addr dst,
 	gettimeofday(&tv_recv, NULL);
 	if (nfound < 0) {
 		logging(LOG_ERR, "select: %s", strerror(errno));
-		return -1;
+		return errno;
 	}
 	if (nfound == 0) {
 		/* icmp request timeout */
 		logging(LOG_DEBUG, "%s: %d bytes ping timeout",
 		    inet_ntoa(dst), size);
-		/* continuable error */
-		return 1;
+		return ETIMEDOUT;
 	}
 
 	rc = read(s, rcvbuf, sizeof(rcvbuf));
 	if (rc <= 0) {
 		logging(LOG_ERR, "read: %s", strerror(errno));
-		return -1;
+		return errno;
 	}
 
 	ip = (struct ip *)rcvbuf;
@@ -301,13 +292,13 @@ pinger(int s, struct in_addr src, struct in_addr dst,
 			logging(LOG_ERR,
 			    "%s: send %d bytes icmp: ICMP Unreachable code %d",
 			    inet_ntoa(dst), size, icmp->icmp_code);
-			return 2;
+			return EHOSTUNREACH;
 		default:
 			logging(LOG_ERR,
 			    "%s: send %d bytes icmp: ICMP Error type %d code %d",
 			    inet_ntoa(dst), size,
 			    icmp->icmp_type, icmp->icmp_code);
-			return -1;
+			return ECONNREFUSED;
 		}
 	}
 
@@ -370,7 +361,6 @@ detectmtu(struct in_addr dst, struct in_addr src, int dontroute)
 		}
 	}
 
-
 	/*
 	 * detect MTU size with binary search.
 	 * MTU size must be even.
@@ -384,31 +374,35 @@ detectmtu(struct in_addr dst, struct in_addr src, int dontroute)
 		if (mtu <= (unsigned int)(mtusize_min / 2))
 			rc = 0;
 		else {
-			/* retry 3 times, if failure */
+			/* retry 3 times, if it timed out */
 			for (i = 0; i < 3; i++) {
 				if (use_arp) {
 					struct ether_addr eth;
-
-					rc = arpresolv(ifname, &src, &dst, &eth, mtu * 2 + ETHER_HDR_LEN, timeout_us);
-					if (rc != ARPRESOLV_TIMEOUT) {
-						break;
-					}
+					rc = arpresolv(ifname, &src, &dst, &eth,
+					    mtu * 2 + ETHER_HDR_LEN,
+					    timeout_us);
 				} else {
-					rc = pinger(s, src, dst, mtu * 2, seq++, timeout_us,
-					    dontroute);
-					if (rc != PINGER_TIMEOUT) {
-						break;
-					}
+					rc = pinger(s, src, dst, mtu * 2, seq++,
+					    timeout_us, dontroute);
 				}
+				if (rc != ETIMEDOUT)
+					break;
 			}
 		}
 
-		if (rc < 0)
-			return -1;
-		if (rc == 0) {
+		switch (rc) {
+		case 0:
 			result = mtu * 2;
 			base = mtu + 1;
 			d--;
+			break;
+		case EMSGSIZE:
+			break;
+		case ETIMEDOUT:
+			break;
+		default:
+			/* other (system?) errors */
+			return -1;
 		}
 	}
 	return result;
@@ -779,9 +773,6 @@ main(int argc, char *argv[])
 		logging(LOG_ERR, "socket: PF_ROUTE: %s", strerror(errno));
 		return EX_OSERR;
 	}
-
-//	logging_filter(LOG_DEBUG, 1);
-//	logging_filter(LOG_INFO, 1);
 
 	if (do_daemon) {
 		daemon(0, 0);

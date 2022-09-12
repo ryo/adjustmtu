@@ -132,11 +132,11 @@ arpresolv(const char *ifname, struct in_addr *src, struct in_addr *dst, struct e
 		if (errno == EMSGSIZE) {
 			logging(LOG_DEBUG, "%s: send %d+%d bytes padded arp query: %s",
 			    inet_ntoa(*dst), ETHER_HDR_LEN, pktsize - ETHER_HDR_LEN, strerror(errno));
-			return ARPRESOLV_TOOBIG;
+			return errno;
 		}
 		logging(LOG_ERR, "%s: send %d+%d bytes padded arp query: %s",
 		    inet_ntoa(*dst), ETHER_HDR_LEN, pktsize - ETHER_HDR_LEN, strerror(errno));
-		return -1;
+		return errno;
 	}
 
 
@@ -156,8 +156,8 @@ arpresolv(const char *ifname, struct in_addr *src, struct in_addr *dst, struct e
 		if (nfound == 0) {
 			logging(LOG_DEBUG, "%s: %d+%d bytes padded arp query timeout",
 			    inet_ntoa(*dst), ETHER_HDR_LEN, pktsize - ETHER_HDR_LEN);
-			rc = ARPRESOLV_TIMEOUT;
-			break;	/* retry */
+			rc = ETIMEDOUT;
+			break;
 		}
 		if (FD_ISSET(fd, &rfd)) {
 			ssize_t size = read(fd, bpfbuf, bpfbuflen);
